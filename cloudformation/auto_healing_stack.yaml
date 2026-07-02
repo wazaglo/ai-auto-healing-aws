@@ -1,0 +1,298 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AI-Driven Auto-Healing System Stack
+
+Parameters:
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+    ConstraintDescription: Must be a valid EC2 instance type
+
+  KeyName:
+    Description: Name of existing EC2 KeyPair for SSH access
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: ""
+
+  SSHLocation:
+    Description: IP address allowed to SSH (0.0.0.0/0 for anywhere)
+    Type: String
+    Default: 0.0.0.0/0
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      AmazonLinuxAMI: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+  # SNS Topic for alerts
+  AutoHealSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: AutoHealAlerts
+      DisplayName: Auto-Healing Alerts
+
+  # IAM Role for EC2
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AI-AutoHeal-EC2-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: AI-AutoHeal-EC2-Profile
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AI-AutoHeal-Lambda-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2FullAccess
+        - arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonSNSFullAccess
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+
+  # Security Group
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: AI-AutoHeal-SG
+      GroupDescription: Security group for AI auto-healing web server
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  # EC2 Instance
+  WebServerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AmazonLinuxAMI]
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !Ref WebServerSecurityGroup
+      KeyName: !Ref KeyName
+      Tags:
+        - Key: Name
+          Value: AI-AutoHealing-Instance
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+
+          dnf update -y
+          dnf install -y python3 python3-pip nginx git amazon-cloudwatch-agent
+
+          pip3 install flask boto3 gunicorn
+
+          mkdir -p /var/log/flask
+
+          cat > /home/ec2-user/app.py << 'PYEOF'
+          from flask import Flask, jsonify, render_template_string
+          import datetime, random, os, logging
+          logging.basicConfig(filename='/var/log/flask/app.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+          app = Flask(__name__)
+          HTML = '''<!DOCTYPE html><html><head><title>AI Auto-Healing Demo</title><style>body{font-family:Arial,sans-serif;text-align:center;padding:50px;background:#f0f0f0}.container{background:white;padding:30px;border-radius:10px;max-width:600px;margin:0 auto;box-shadow:0 4px 6px rgba(0,0,0,0.1)}.status{padding:20px;margin:20px 0;border-radius:8px;font-size:18px}.healthy{background:#90EE90}.error{background:#FF6B6B;color:white}button{padding:15px 30px;font-size:16px;cursor:pointer;border:none;border-radius:5px;margin:5px}.btn-error{background:#FF6B6B;color:white}.btn-health{background:#2196F3;color:white}.metrics{margin-top:20px;padding:15px;background:#f8f9fa;border-radius:5px}</style></head><body><div class="container"><h1>AI Auto-Healing Demo</h1><p><strong>Instance:</strong> {{instance_id}}</p><div class="status {{status_class}}"><h2>Status: {{status}}</h2></div><div><button class="btn-error" onclick="location.href='/trigger-error'">Trigger Error</button><button class="btn-health" onclick="location.href='/health'">Health</button></div></div></body></html>'''
+          ec, tr = 0, 0
+          @app.route('/')
+          def home(): global tr; tr+=1; return render_template_string(HTML, instance_id=os.popen('curl -s http://169.254.169.254/latest/meta-data/instance-id').read().strip(), status='HEALTHY', status_class='healthy')
+          @app.route('/trigger-error')
+          def err(): global ec,tr; tr+=1; ec+=1; logging.error(f"ERROR: error #{ec}"); print(f"ERROR: error #{ec}"); return render_template_string(HTML, instance_id=os.popen('curl -s http://169.254.169.254/latest/meta-data/instance-id').read().strip(), status='ERROR', status_class='error'), 500
+          @app.route('/health')
+          def h(): return jsonify({'status':'healthy','error_rate':round((ec/(tr or 1))*100,1)})
+          app.run(host='0.0.0.0',port=5000)
+          PYEOF
+
+          cat > /etc/systemd/system/flaskapp.service << UNITEOF
+          [Unit]
+          Description=Flask AI Demo App
+          After=network.target
+          [Service]
+          ExecStart=/usr/local/bin/gunicorn --workers 3 --bind 0.0.0.0:5000 app:app
+          WorkingDirectory=/home/ec2-user
+          Restart=always
+          User=ec2-user
+          Environment=PYTHONUNBUFFERED=1
+          StandardOutput=append:/var/log/flask/app.log
+          StandardError=append:/var/log/flask/app.log
+          [Install]
+          WantedBy=multi-user.target
+          UNITEOF
+
+          systemctl daemon-reload && systemctl enable flaskapp && systemctl start flaskapp
+
+          cat > /etc/nginx/nginx.conf << 'NGINXEOF'
+          user nginx; worker_processes auto; error_log /var/log/nginx/error.log; pid /run/nginx.pid; events { worker_connections 1024; }
+          http { access_log /var/log/nginx/access.log main; sendfile on; tcp_nopush on; tcp_nodelay on; keepalive_timeout 65; include /etc/nginx/mime.types; default_type application/octet-stream;
+            server { listen 80 default_server; listen [::]:80 default_server; server_name _;
+              location / { proxy_pass http://127.0.0.1:5000; proxy_set_header Host $host; proxy_set_header X-Real-IP $remote_addr; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
+            }
+          }
+          NGINXEOF
+
+          systemctl enable nginx && systemctl restart nginx
+
+          INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/config.json << CWEOF
+          { "agent": { "metrics_collection_interval": 60, "run_as_user": "root" }, "logs": { "logs_collected": { "files": { "collect_list": [
+            { "file_path": "/var/log/flask/app.log", "log_group_name": "/app/ai-demo", "log_stream_name": "${INSTANCE_ID}", "timezone": "UTC" },
+            { "file_path": "/var/log/nginx/access.log", "log_group_name": "/app/ai-demo", "log_stream_name": "${INSTANCE_ID}-nginx-access", "timezone": "UTC" },
+            { "file_path": "/var/log/nginx/error.log", "log_group_name": "/app/ai-demo", "log_stream_name": "${INSTANCE_ID}-nginx-error", "timezone": "UTC" }
+          ]} } } }
+          CWEOF
+
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/config.json -s
+
+  # Lambda Function
+  AutoHealLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AI-AutoHeal-Handler
+      Runtime: python3.14
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: auto_heal_handler.lambda_handler
+      Timeout: 180
+      MemorySize: 128
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref WebServerInstance
+          LOG_GROUP_NAME: /app/ai-demo
+          SNS_TOPIC_ARN: !Ref AutoHealSNSTopic
+      Code:
+        ZipFile: |
+          import json, boto3, os, time, re
+          from datetime import datetime
+          logs_c = boto3.client('logs'); ec2_c = boto3.client('ec2'); sns_c = boto3.client('sns'); br_c = boto3.client('bedrock-runtime', region_name='us-east-1')
+          INSTANCE_ID = os.environ.get('INSTANCE_ID',''); LOG_GROUP = os.environ.get('LOG_GROUP_NAME','/app/ai-demo'); SNS_ARN = os.environ.get('SNS_TOPIC_ARN','')
+          def handler(ev, ctx):
+              iid = INSTANCE_ID or ev.get('instance_id','')
+              if not iid: return {'statusCode':400,'body':'no instance'}
+              logs = get_logs(LOG_GROUP)
+              analysis = analyze(logs)
+              action = parse(analysis, iid)
+              if action['priority'] in ['HIGH','MEDIUM']:
+                  ok = remediate(action, iid)
+                  if ok: notify(action, iid)
+              return {'statusCode':200,'body':json.dumps({'message':'done','instance':iid,'action':action})}
+          def get_logs(lg):
+              end = int(time.time()*1000); start = end-300000
+              try:
+                  r = logs_c.filter_log_events(logGroupName=lg.strip(),startTime=start,endTime=end,limit=100)
+                  msgs = [e['message'] for e in r.get('events',[])]
+                  return '\n'.join(msgs[-50:]) if msgs else 'no logs'
+              except: return 'no logs'
+          def analyze(logs):
+              for m in ['amazon.nova-lite-v1:0','amazon.nova-micro-v1:0']:
+                  try:
+                      r = br_c.converse(modelId=m,messages=[{"role":"user","content":[{"text":f"You are an AWS expert. Analyze these logs and suggest a fix.\nLogs:\n{logs}\nRespond in format: ISSUE:\nROOT_CAUSE:\nPRIORITY:\nSUGGESTED_FIX:"}]}],inferenceConfig={"maxTokens":500,"temperature":0.5})
+                      if 'output' in r and 'message' in r['output']:
+                          c = r['output']['message']['content']
+                          if c and 'text' in c[0]: return c[0]['text']
+                  except: continue
+              return "\nISSUE: AI unavailable\nROOT_CAUSE: Model error\nPRIORITY: MEDIUM\nSUGGESTED_FIX: Reboot instance"
+          def parse(ar, iid):
+              a={'priority':'LOW','fix':'none','resource':iid,'action_type':'notify_only'}
+              p=re.search(r'PRIORITY:\s*(\w+)',ar,re.I); f=re.search(r'SUGGESTED_FIX:\s*(.+?)(?:\n|$)',ar,re.I)
+              if p: a['priority']=p.group(1).upper()
+              if f: a['fix']=f.group(1).strip()
+              fl=a['fix'].lower()
+              if 'reboot' in fl: a['action_type']='reboot'
+              return a
+          def remediate(a, iid):
+              try:
+                  if a.get('action_type')=='reboot':
+                      ec2_c.reboot_instances(InstanceIds=[iid]); print(f"rebooted {iid}"); return True
+                  return True
+              except: return False
+          def notify(a, iid):
+              if not SNS_ARN: return
+              sns_c.publish(TopicArn=SNS_ARN,Subject=f'Auto-Heal: {a["action_type"]} on {iid}',
+                  Message=f'Auto-healing alert\nInstance: {iid}\nPriority: {a["priority"]}\nAction: {a["fix"]}\nTime: {datetime.utcnow().isoformat()}')
+
+  # CloudWatch Metric Filter
+  ErrorMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: /app/ai-demo
+      FilterName: ErrorCount
+      FilterPattern: ERROR
+      MetricTransformations:
+        - MetricValue: "1"
+          MetricNamespace: AppMetrics
+          MetricName: ErrorRate
+
+  # CloudWatch Alarm
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: HighErrorRate-Alarm
+      AlarmDescription: Triggered when error rate exceeds 5 in 1 minute
+      Namespace: AppMetrics
+      MetricName: ErrorRate
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref AutoHealSNSTopic
+
+Outputs:
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref WebServerInstance
+
+  PublicIP:
+    Description: Public IP of the web server
+    Value: !GetAtt WebServerInstance.PublicIp
+
+  AppURL:
+    Description: URL to access the application
+    Value: !Sub "http://${WebServerInstance.PublicIp}"
+
+  SNSTopicArn:
+    Description: SNS Topic ARN for alerts
+    Value: !Ref AutoHealSNSTopic
+
+  LambdaFunctionArn:
+    Description: Lambda Function ARN
+    Value: !GetAtt AutoHealLambdaFunction.Arn
