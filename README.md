@@ -4,13 +4,7 @@ An intelligent auto-healing system that detects application errors via CloudWatc
 
 ## Architecture
 
-```
-Flask App (EC2) → CloudWatch Logs → Metric Filter → CloudWatch Alarm
-                                                          |
-                                                    Lambda (Bedrock AI)
-                                                     /              \
-                                          EC2 Reboot          SNS Notification
-```
+![Architecture](docs/architecture.png)
 
 ## Prerequisites
 
