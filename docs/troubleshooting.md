@@ -14,7 +14,7 @@
 **Fix**: Replaced `{instance_id}` with actual instance ID, added Nginx logs, restructured to valid JSON config.
 
 ### Flask print("ERROR: ...") Logs Not Reaching CloudWatch
-**Cause**: Python output buffering — `print()` is block-buffered when stdout is redirected to a file.
+**Cause**: Python output buffering - `print()` is block-buffered when stdout is redirected to a file.
 **Fix**: Added `Environment=PYTHONUNBUFFERED=1` to `flaskapp.service` and redirected stdout/stderr to `/var/log/flask/app.log`.
 
 ### Bedrock AI Model Not Available
